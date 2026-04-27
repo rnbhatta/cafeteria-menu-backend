@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from routes.menu import router as menu_router
 from routes.orders import router as orders_router
 from routes.query import router as query_router
+from routes.agent import router as agent_router
 
 load_dotenv()
 
@@ -23,6 +24,7 @@ app.add_middleware(
 app.include_router(menu_router)
 app.include_router(orders_router)
 app.include_router(query_router)
+app.include_router(agent_router)
 
 
 @app.get("/api/health")
