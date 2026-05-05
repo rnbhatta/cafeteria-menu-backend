@@ -4,6 +4,8 @@ import anthropic
 import json
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from typing import List
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from database import db
@@ -147,11 +149,26 @@ async def agent_chat(req: AgentRequest):
     if not api_key:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set in backend/.env")
 
+    t_start = time.monotonic()
+    log = {
+        "timestamp":       datetime.now(timezone.utc),
+        "model":           "claude-sonnet-4-6",
+        "input_tokens":    0,
+        "output_tokens":   0,
+        "latency_ms":      0.0,
+        "tool_calls":      [],
+        "tool_call_count": 0,
+        "loop_iterations": 0,
+        "success":         False,
+        "stop_reason":     "unknown",
+    }
+
     try:
         client = anthropic.Anthropic(api_key=api_key)
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
         for _ in range(10):  # max tool loop iterations
+            log["loop_iterations"] += 1
             response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1024,
@@ -160,16 +177,27 @@ async def agent_chat(req: AgentRequest):
                 messages=messages,
             )
 
+            # accumulate token usage
+            if response.usage:
+                log["input_tokens"]  += response.usage.input_tokens
+                log["output_tokens"] += response.usage.output_tokens
+
             if response.stop_reason == "end_turn":
                 text = next(
                     (block.text for block in response.content if hasattr(block, "text")), ""
                 )
+                log["success"]     = True
+                log["stop_reason"] = "end_turn"
+                log["latency_ms"]  = round((time.monotonic() - t_start) * 1000, 1)
+                await db.inference_logs.insert_one(log)
                 return {"reply": text}
 
             if response.stop_reason == "tool_use":
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
+                        log["tool_calls"].append(block.name)
+                        log["tool_call_count"] += 1
                         result = await run_tool(block.name, block.input)
                         tool_results.append({
                             "type": "tool_result",
@@ -179,13 +207,25 @@ async def agent_chat(req: AgentRequest):
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
             else:
+                log["stop_reason"] = response.stop_reason or "unknown"
                 break
 
+        log["latency_ms"] = round((time.monotonic() - t_start) * 1000, 1)
+        await db.inference_logs.insert_one(log)
         return {"reply": "I'm sorry, I couldn't complete that request."}
 
     except anthropic.AuthenticationError:
+        log["latency_ms"]  = round((time.monotonic() - t_start) * 1000, 1)
+        log["stop_reason"] = "auth_error"
+        await db.inference_logs.insert_one(log)
         raise HTTPException(status_code=401, detail="Invalid Anthropic API key.")
     except anthropic.APIConnectionError:
+        log["latency_ms"]  = round((time.monotonic() - t_start) * 1000, 1)
+        log["stop_reason"] = "connection_error"
+        await db.inference_logs.insert_one(log)
         raise HTTPException(status_code=503, detail="Could not reach Anthropic API.")
     except anthropic.APIError as e:
+        log["latency_ms"]  = round((time.monotonic() - t_start) * 1000, 1)
+        log["stop_reason"] = "api_error"
+        await db.inference_logs.insert_one(log)
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {str(e)}")
